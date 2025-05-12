@@ -12,7 +12,7 @@ This project introduces **MTSIR3-GAN**, a novel approach for Multivariate Time S
 * **Innovation:** Features a bespoke time-series patching strategy to enable R3GAN's application to sequential data.
 * **Evaluation:** Provides comprehensive experimental results demonstrating MTSIR3-GAN's competitive performance against baselines (TimesNet, SSGAN) on standard benchmark datasets (PhysioNet Challenge 2012, Beijing Air Quality, PSM).
 * **Robustness:** Shows effectiveness in handling complex temporal dependencies and robustness towards data anomalies.
-* **GUI:** Includes an interactive Dash-based interface for demonstrating the imputation system (details in Chapter 4).
+* **GUI:** Includes an interactive Dash-based interface for demonstrating the imputation system.
 
 **Goal:**
 
