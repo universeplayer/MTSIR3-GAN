@@ -20,4 +20,4 @@ To address the critical problem of missing data in multivariate time series by d
 
 **Keywords:**
 
-Multivariate Time Series Imputation (MTSI), Generative Adversarial Networks (GANs), R3GAN, Deep Learning, Time Series Analysis, Missing Data, Data Imputation, PhysioNet, Air Quality, PSM.
+Multivariate Time Series, Data Imputation, Generative Adversarial Networks (GANs), Generative Models, Deep Learning PhysioNet, Air Quality, PSM.
