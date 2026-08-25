@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software or its results, please cite the MiLeTS 2026 paper below."
+title: "Adversarial Refinement for Time Series Imputation"
+type: software
+authors:
+  - family-names: "He"
+    given-names: "Yufeng"
+    orcid: "https://orcid.org/0009-0003-2146-7400"
+repository-code: "https://github.com/he-yufeng/adversarial-refinement-imputation"
+url: "https://github.com/he-yufeng/adversarial-refinement-imputation"
+license: MIT
+version: 1.0.0
+preferred-citation:
+  type: conference-paper
+  authors:
+    - family-names: "He"
+      given-names: "Yufeng"
+      orcid: "https://orcid.org/0009-0003-2146-7400"
+  title: "When Does Adversarial Refinement Help? A Negative Result and Open Problem in Adapting R3GAN to Time Series Imputation"
+  collection-title: "12th SIGKDD Workshop on Mining and Learning from Time Series (MiLeTS)"
+  year: 2026
+  url: "https://kdd-milets.github.io/milets2026/accepted%20papers/16main_milets2026_sigconf%201.pdf"

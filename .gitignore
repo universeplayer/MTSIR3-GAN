@@ -221,6 +221,11 @@ FMGAN/paper/CAMERA_READY_EMAIL.md
 FMGAN/paper/REVIEWS_MILETS2026.md
 FMGAN/paper/submissions/
 
+# Local presentation and onsite operations archive. This directory contains
+# historical poster versions, personal QR/headshot assets, printing/payment
+# records, and attendee follow-up notes; keep it out of the public Git history.
+FMGAN/presentation/
+
 # Superseded non-sigconf draft (the *_sigconf version is the published camera-ready)
 FMGAN/paper/main_milets2026.tex
 FMGAN/paper/main_milets2026.pdf

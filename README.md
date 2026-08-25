@@ -11,24 +11,25 @@ Code and paper for:
 
 > **When Does Adversarial Refinement Help? A Negative Result and Open Problem in Adapting R3GAN to Time Series Imputation**
 > Yufeng He (The University of Hong Kong)
-> *12th SIGKDD Workshop on Mining and Learning from Time Series (**MiLeTS 2026**).*
-> 📄 Paper: [`FMGAN/paper/main_milets2026_sigconf.pdf`](FMGAN/paper/main_milets2026_sigconf.pdf)
+> *[12th SIGKDD Workshop on Mining and Learning from Time Series (**MiLeTS 2026**)](https://kdd-milets.github.io/milets2026/).*
+> 📄 Paper: [`FMGAN/paper/main_milets2026_sigconf.pdf`](FMGAN/paper/main_milets2026_sigconf.pdf) · [official workshop copy](https://kdd-milets.github.io/milets2026/accepted%20papers/16main_milets2026_sigconf%201.pdf)
 
 ---
 
 ## TL;DR
 
-Diffusion models and transformers have supplanted GANs for multivariate time series imputation, largely on grounds of **GAN training instability**. [R3GAN](https://github.com/brownvc/R3GAN) (NeurIPS 2024) removes that instability with regularized relativistic losses and provable convergence — so we asked: *does a stable, modern GAN revive adversarial imputation?*
+Diffusion models and transformers have largely supplanted GANs for multivariate time series imputation. [R3GAN](https://github.com/brownvc/R3GAN) (NeurIPS 2024) offers a modern regularized relativistic GAN baseline, so we asked: *does adapting that system revive adversarial refinement for time-series imputation?*
 
-We adapt R3GAN to 1D temporal data (**R3GAN-1D**) as a coarse-to-fine **refiner** with a frequency-domain discriminator, and run a systematic study across 3 datasets and 15+ configurations. **The answer is a clearly-scoped negative result:**
+We adapt R3GAN to 1D temporal data (**R3GAN-1D**) as a coarse-to-fine **refiner** with a frequency-domain discriminator, and audit all **14 saved configurations** across 3 datasets. The configurations are heterogeneous and have one saved stochastic run each, so the result is descriptive rather than a controlled causal ablation. **The pattern is a clearly scoped negative result:**
 
-- ✅ R3GAN-1D **dramatically improves distributionally implausible** coarse imputers — **48–70% MAE reduction** over zero / mean fill.
-- ❌ It yields **no improvement over a strong coarse imputer** (linear interpolation, |Δ| < 1.5%), and as a standalone imputer it is **5.8× worse than BRITS**.
-- 🔍 The textbook "GANs optimize distributional, not point-wise, objectives" explanation **cannot be the whole story** — diffusion models are *also* distributional yet are SoTA at this point-wise task. Our ablations instead implicate the **adversarial signal specifically**, and we frame the precise mechanism as an **open problem**.
+- ✅ In all 5 saved zero/mean-start configurations, the full R3GAN-1D system reduced MAE by **48.4–70.2%**.
+- ❌ The results contain 9 linear-start configurations. After excluding the one documented legacy logging anomaly, the 8 eligible configurations have mean change **−0.7%** (range **−3.0% to +1.1%**): no consistent saved-run gain beyond a plausible coarse fill.
+- 🔍 One legacy AirQuality run reports **−21.9%**, but its training log records zero reconstruction loss for all 200 epochs despite a nonzero configured weight. It is shown for provenance and excluded from the aggregate.
+- 🧪 These runs do **not** identify which R3GAN-1D component caused the pattern. The decisive next experiment is a matched reconstruction-only control with shared masks, train-only scaling, and multiple recorded seeds.
 
-This is a negative-result workshop paper: the value is in **controlling away GAN instability** and sharpening *why* adversarial discrimination fails to provide useful conditional-refinement gradients where denoising/diffusion objectives succeed.
+This is a negative-result workshop paper: the value is in exposing a baseline-strength pattern, surfacing every saved run and anomaly, and defining the control needed to test whether adversarial discrimination adds value beyond the generator's reconstruction path.
 
-## Key result — refinement only helps weak coarse imputers
+## Key result — a baseline-strength pattern in the saved runs
 
 MAE ↓ (lower is better). `Δ` = relative MAE reduction (positive = improvement).
 
@@ -37,7 +38,7 @@ MAE ↓ (lower is better). `Δ` = relative MAE reduction (positive = improvement
 | Weather     | Zero fill         | 0.728  | 0.228 | **+68.6%** |
 |             | Mean fill         | 0.728  | 0.223 | **+69.4%** |
 |             | Linear interp     | 0.067  | 0.067 | +1.1%      |
-| Electricity | Zero fill         | 0.832  | 0.427 | **+48.7%** |
+| Electricity | Zero fill         | 0.832  | 0.426 | **+48.7%** |
 |             | Mean fill         | 0.831  | 0.429 | **+48.4%** |
 |             | Linear interp     | 0.164  | 0.165 | −0.7%      |
 | AirQuality  | Zero fill         | 0.765  | 0.228 | **+70.2%** |
@@ -53,7 +54,12 @@ Standalone vs. established methods (Weather, 25% point-missing):
 | R3GAN-1D + linear    | GAN refine   | 0.067 |
 | R3GAN-1D standalone  | GAN          | 0.228 |
 
-> The large percentage gains are improvements over *trivial* baselines no practitioner would deploy. R3GAN-1D never improves on a competent baseline.
+> The table shows selected configurations with absolute MAE values. Across all
+> 14 saved configurations, all 5 zero/mean starts improved by 48.4–70.2%; the
+> 8 aggregate-eligible linear starts averaged −0.7% and ranged from −3.0% to +1.1%.
+> These heterogeneous runs are not repeated seeds or a controlled coarse-method
+> ablation. The separate legacy −21.9% logging anomaly is retained in the raw
+> results and excluded from that aggregate.
 
 ## Reproduce the paper tables
 
@@ -63,7 +69,7 @@ The raw per-run outputs live in [`FMGAN/results/`](FMGAN/results/); the tables a
 python3 FMGAN/analysis.py
 ```
 
-This walks `FMGAN/results/results/phase1_*/results.json` + `baseline_*.json` and prints the refinement and comparison tables. It prints **every** run, so you also see the spread behind each cell: for strong (linear-interpolation) coarse fills, all variants land in **[−21.9%, +1.1%]** (mean −3.1%), reinforcing that adversarial refinement never meaningfully improves a competent baseline — and can hurt it.
+This walks `FMGAN/results/results/phase1_*/results.json` + `baseline_*.json` and prints the refinement and comparison tables. It prints **every** run and marks aggregate eligibility explicitly. Across the 8 eligible linear-start configurations, changes lie in **[−3.0%, +1.1%]** with mean **−0.7%**. The separately displayed legacy AirQuality run is a **−21.9% logging anomaly** and is retained in the detailed table but omitted by the script's named aggregate-exclusion registry. The script also rejects stored `Δ%` values that do not recompute from their saved before/after MAEs.
 
 ## Repository structure
 
@@ -113,7 +119,10 @@ Honest scope (also in the paper, expanded for camera-ready):
 
 - The most direct control — a **reconstruction-only (discriminator-removed) ablation** — is the single most valuable next experiment; our current evidence (a reconstruction-weight sweep) is indirect.
 - An **in-protocol diffusion baseline** (CSDI / FGTI on all three datasets), **multi-seed error bars**, and **block / higher-rate / MNAR** settings would further strengthen the claim.
-- The open problem: *why does a learned diffusion denoiser succeed at point-wise imputation while a GAN discriminator fails, when both optimize distributional objectives?* We conjecture the deficit is in the **form of the learning signal** (global discrimination vs. conditional per-position regression), not in distribution-matching per se.
+- The open problem: under matched data handling and model controls, does the
+  discriminator add useful conditional-refinement signal beyond the same
+  generator trained only with reconstruction? The current saved runs cannot
+  answer that causal question.
 
 ## Citation
 
