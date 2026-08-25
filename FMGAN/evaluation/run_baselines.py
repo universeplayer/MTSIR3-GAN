@@ -20,6 +20,117 @@ if _FMGAN_ROOT not in sys.path:
     sys.path.insert(0, _FMGAN_ROOT)
 
 from evaluation.metrics import compute_all_metrics
+from data.unified_loader import MissingPatternGenerator, fit_standard_scaler
+from protocol import derive_seed, seed_everything
+
+
+def split_raw_data(X):
+    """Split before windowing so no raw timestep crosses split boundaries.
+
+    Two-dimensional inputs are continuous timelines and must be windowed only
+    after this split. Three-dimensional inputs are already independent samples
+    and are split on their sample axis.
+    """
+    X = np.asarray(X)
+    if X.ndim not in (2, 3):
+        raise ValueError(f'expected 2D timeline or 3D samples, got {X.shape}')
+
+    n = len(X)
+    train_stop = int(0.7 * n)
+    val_stop = int(0.85 * n)
+    splits = {
+        'train': X[:train_stop],
+        'val': X[train_stop:val_stop],
+        'test': X[val_stop:],
+    }
+    empty = [name for name, split in splits.items() if len(split) == 0]
+    if empty:
+        raise ValueError(
+            'dataset is too short for non-empty 70/15/15 splits: '
+            + ', '.join(empty)
+        )
+    return splits, X.ndim == 2
+
+
+def window_timeline(X, seq_len, stride=None, split_name='split'):
+    """Window one already-isolated timeline without crossing a boundary."""
+    stride = stride or seq_len // 2
+    if seq_len <= 0 or stride <= 0:
+        raise ValueError('seq_len and stride must be positive')
+    if len(X) < seq_len:
+        raise ValueError(
+            f'{split_name} has {len(X)} timesteps, shorter than seq_len={seq_len}'
+        )
+    return np.stack([
+        X[start:start + seq_len]
+        for start in range(0, len(X) - seq_len + 1, stride)
+    ])
+
+
+def scale_splits_train_only(raw_splits):
+    """Fit one scaler on flattened training observations and transform all splits."""
+    train = raw_splits['train']
+    n_features = train.shape[-1]
+    scaler = fit_standard_scaler(train.reshape(-1, n_features))
+
+    scaled = {}
+    for name, split in raw_splits.items():
+        shape = split.shape
+        transformed = scaler.transform(split.reshape(-1, n_features))
+        scaled[name] = transformed.reshape(shape).astype(np.float32)
+    return scaled, scaler
+
+
+def generate_artificial_mask(shape, missing_rate, missing_pattern, seed):
+    """Generate one split's artificial mask from an independent seed."""
+    rng = np.random.default_rng(derive_seed(seed))
+    if missing_pattern == 'point':
+        return (rng.random(shape) > missing_rate).astype(np.float32)
+
+    generator = MissingPatternGenerator()
+    if missing_pattern == 'subsequence':
+        return generator.subsequence_missing(shape, missing_rate, rng=rng)
+    if missing_pattern == 'block':
+        return generator.block_missing(shape, missing_rate, rng=rng)
+    raise ValueError(f'unknown missing pattern: {missing_pattern}')
+
+
+def apply_artificial_missing(X, artificial_mask):
+    """Combine natural and artificial missingness without inventing targets."""
+    X = np.asarray(X)
+    artificial_mask = np.asarray(artificial_mask, dtype=np.float32)
+    if X.shape != artificial_mask.shape:
+        raise ValueError(
+            f'data/mask shape mismatch: {X.shape} vs {artificial_mask.shape}'
+        )
+
+    original_mask = (~np.isnan(X)).astype(np.float32)
+    combined_mask = original_mask * artificial_mask
+    indicating_mask = original_mask * (1 - artificial_mask)
+    X_missing = X.copy()
+    X_missing[combined_mask == 0] = np.nan
+    # Metrics only evaluate indicating_mask==1. Replacing unknown natural
+    # targets prevents IEEE NaN*0 propagation in the legacy metric functions.
+    X_intact = np.nan_to_num(X.copy(), nan=0.0)
+    return X_intact, X_missing, combined_mask, indicating_mask
+
+
+def masked_metric_inputs(pred, target, indicating_mask):
+    """Zero non-evaluation positions and reject non-finite evaluated values."""
+    pred = np.asarray(pred)
+    target = np.asarray(target)
+    indicating_mask = np.asarray(indicating_mask)
+    selected = indicating_mask.astype(bool)
+    if not selected.any():
+        raise ValueError('indicating mask selects no evaluation positions')
+    if not np.isfinite(pred[selected]).all():
+        raise ValueError('predictions are non-finite at evaluation positions')
+    if not np.isfinite(target[selected]).all():
+        raise ValueError('targets are non-finite at evaluation positions')
+    return (
+        np.where(selected, pred, 0.0),
+        np.where(selected, target, 0.0),
+    )
 
 
 def run_pypots_baseline(method_name, dataset_name, missing_rate=0.25,
@@ -30,6 +141,7 @@ def run_pypots_baseline(method_name, dataset_name, missing_rate=0.25,
     Returns:
         dict with metrics and timing info
     """
+    seed_everything(seed, deterministic=True)
     from pypots.imputation import SAITS, CSDI, BRITS
     import tsdb
 
@@ -52,65 +164,47 @@ def run_pypots_baseline(method_name, dataset_name, missing_rate=0.25,
             os.path.dirname(__file__), '..', '..', 'datasets', dataset_name, 'data.npz'
         )
         loaded = np.load(data_path)
-        X_full = loaded['X']
-        # Window into samples
-        samples = []
-        stride = seq_len // 2
-        for start in range(0, len(X_full) - seq_len + 1, stride):
-            samples.append(X_full[start:start + seq_len])
-        X = np.stack(samples)
+        X = loaded['X']
 
-    if X.ndim == 2:
-        # Reshape flat data into windows
-        n_features = X.shape[-1]
-        samples = []
-        stride = seq_len // 2
-        for start in range(0, len(X) - seq_len + 1, stride):
-            samples.append(X[start:start + seq_len])
-        X = np.stack(samples)
+    # Split the raw timeline/sample axis before normalization or windowing.
+    raw_splits, needs_windowing = split_raw_data(X)
+    scaled_splits, _scaler = scale_splits_train_only(raw_splits)
+    if needs_windowing:
+        scaled_splits = {
+            name: window_timeline(split, seq_len, split_name=name)
+            for name, split in scaled_splits.items()
+        }
 
-    # Normalize
-    from sklearn.preprocessing import StandardScaler
-    orig_shape = X.shape
-    X_flat = X.reshape(-1, X.shape[-1])
-    scaler = StandardScaler()
-    X_flat = scaler.fit_transform(X_flat)
-    X = X_flat.reshape(orig_shape).astype(np.float32)
-
-    # Split: 70% train, 15% val, 15% test
-    n = len(X)
-    n_train = int(0.7 * n)
-    n_val = int(0.15 * n)
-    X_train = X[:n_train]
-    X_val = X[n_train:n_train + n_val]
-    X_test = X[n_train + n_val:]
+    X_train = scaled_splits['train']
+    X_val = scaled_splits['val']
+    X_test = scaled_splits['test']
+    X = np.concatenate([X_train, X_val, X_test], axis=0)
 
     # Apply artificial missing
-    rng = np.random.default_rng(seed)
-    X_test_intact = X_test.copy()
+    split_seeds = {
+        'train': derive_seed(seed, 0),
+        'val': derive_seed(seed, 1),
+        'test': derive_seed(seed, 2),
+    }
+    train_artificial = generate_artificial_mask(
+        X_train.shape, missing_rate, missing_pattern, split_seeds['train'],
+    )
+    val_artificial = generate_artificial_mask(
+        X_val.shape, missing_rate, missing_pattern, split_seeds['val'],
+    )
+    test_artificial = generate_artificial_mask(
+        X_test.shape, missing_rate, missing_pattern, split_seeds['test'],
+    )
 
-    if missing_pattern == 'point':
-        test_mask = (rng.random(X_test.shape) > missing_rate).astype(np.float32)
-    else:
-        from data.unified_loader import MissingPatternGenerator  # noqa: E402
-        gen = MissingPatternGenerator()
-        if missing_pattern == 'subsequence':
-            test_mask = gen.subsequence_missing(X_test.shape, missing_rate, rng)
-        else:
-            test_mask = gen.block_missing(X_test.shape, missing_rate, rng)
-
-    indicating_mask = (1 - test_mask).astype(np.float32)
-    X_test_missing = X_test.copy()
-    X_test_missing[test_mask == 0] = np.nan
-
-    # Also create training data with missing values
-    train_mask = (rng.random(X_train.shape) > missing_rate).astype(np.float32)
-    X_train_missing = X_train.copy()
-    X_train_missing[train_mask == 0] = np.nan
-
-    val_mask = (rng.random(X_val.shape) > missing_rate).astype(np.float32)
-    X_val_missing = X_val.copy()
-    X_val_missing[val_mask == 0] = np.nan
+    _, X_train_missing, train_mask, _ = apply_artificial_missing(
+        X_train, train_artificial,
+    )
+    X_val_intact, X_val_missing, val_mask, val_indicating_mask = apply_artificial_missing(
+        X_val, val_artificial,
+    )
+    X_test_intact, X_test_missing, test_mask, indicating_mask = apply_artificial_missing(
+        X_test, test_artificial,
+    )
 
     # Prepare PyPOTS dataset dict
     dataset_dict = {
@@ -178,7 +272,11 @@ def run_pypots_baseline(method_name, dataset_name, missing_rate=0.25,
     t_start = time.time()
     model.fit(
         train_set={'X': X_train_missing},
-        val_set={'X': X_val_missing, 'X_ori': X_val},
+        val_set={
+            'X': X_val_missing,
+            'X_ori': X_val_intact,
+            'indicating_mask': val_indicating_mask,
+        },
     )
     train_time = time.time() - t_start
 
@@ -191,13 +289,17 @@ def run_pypots_baseline(method_name, dataset_name, missing_rate=0.25,
     X_pred = results['imputation']
 
     # Compute metrics on indicating_mask positions only
-    metrics = compute_all_metrics(X_pred, X_test_intact, indicating_mask)
+    X_pred_eval, X_target_eval = masked_metric_inputs(
+        X_pred, X_test_intact, indicating_mask,
+    )
+    metrics = compute_all_metrics(X_pred_eval, X_target_eval, indicating_mask)
     metrics['train_time_s'] = round(train_time, 1)
     metrics['infer_time_s'] = round(infer_time, 3)
     metrics['method'] = method_name
     metrics['dataset'] = dataset_name
     metrics['missing_rate'] = missing_rate
     metrics['missing_pattern'] = missing_pattern
+    metrics['seed'] = seed
 
     print(f"\nResults for {method_name} on {dataset_name}:")
     for k, v in metrics.items():
@@ -212,8 +314,9 @@ def run_pypots_baseline(method_name, dataset_name, missing_rate=0.25,
 def run_moment_baseline(dataset_name, missing_rate=0.25, missing_pattern='point',
                         seq_len=96, seed=42):
     """Run MOMENT foundation model as a baseline."""
+    seed_everything(seed, deterministic=True)
     from foundation_model.moment_wrapper import MOMENTImputer
-    from data.unified_loader import TimeSeriesImputationDataset
+    from data.unified_loader import TimeSeriesImputationDataset, fit_standard_scaler
 
     print(f"\n{'='*60}")
     print(f"Running MOMENT on {dataset_name} (rate={missing_rate}, pattern={missing_pattern})")
@@ -226,11 +329,13 @@ def run_moment_baseline(dataset_name, missing_rate=0.25, missing_pattern='point'
     loaded = np.load(data_path)
     X_full = loaded['X']
     n = len(X_full)
+    X_train_raw = X_full[:int(0.7 * n)]
     X_test_raw = X_full[int(0.85 * n):]
+    scaler = fit_standard_scaler(X_train_raw)
 
     dataset = TimeSeriesImputationDataset(
         X_test_raw, seq_len=seq_len, missing_rate=missing_rate,
-        missing_pattern=missing_pattern, seed=seed,
+        missing_pattern=missing_pattern, seed=seed, scaler=scaler,
     )
 
     # Collect all test data
@@ -264,6 +369,7 @@ def run_moment_baseline(dataset_name, missing_rate=0.25, missing_pattern='point'
     metrics['dataset'] = dataset_name
     metrics['missing_rate'] = missing_rate
     metrics['missing_pattern'] = missing_pattern
+    metrics['seed'] = seed
 
     print(f"\nResults for MOMENT on {dataset_name}:")
     for k, v in metrics.items():

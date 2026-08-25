@@ -24,8 +24,9 @@ if _FMGAN_ROOT not in sys.path:
     sys.path.insert(0, _FMGAN_ROOT)
 
 from foundation_model.moment_wrapper import MOMENTImputer
-from data.unified_loader import TimeSeriesImputationDataset
+from data.unified_loader import TimeSeriesImputationDataset, fit_standard_scaler
 from evaluation.metrics import compute_all_metrics
+from protocol import make_dataloader_generator, seed_dataloader_worker, seed_everything
 
 
 class SimpleGANRefiner(nn.Module):
@@ -89,7 +90,8 @@ class SimpleGANRefiner(nn.Module):
         return self.discriminator(x)
 
 
-def train_refiner(refiner, train_data, n_features, epochs=50, lr=1e-4, device='cuda'):
+def train_refiner(refiner, train_data, n_features, epochs=50, lr=1e-4,
+                  device='cuda', seed=42):
     """Quick training loop for the refiner."""
     opt_g = torch.optim.Adam(refiner.generator.parameters(), lr=lr, betas=(0.0, 0.9))
     opt_d = torch.optim.Adam(refiner.discriminator.parameters(), lr=lr, betas=(0.0, 0.9))
@@ -97,7 +99,11 @@ def train_refiner(refiner, train_data, n_features, epochs=50, lr=1e-4, device='c
     X_obs, mask, X_coarse, X_intact = [torch.from_numpy(x).float().to(device) for x in train_data]
 
     dataset = torch.utils.data.TensorDataset(X_obs, mask, X_coarse, X_intact)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True, drop_last=True)
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=32, shuffle=True, drop_last=True,
+        generator=make_dataloader_generator(seed),
+        worker_init_fn=seed_dataloader_worker,
+    )
 
     refiner.train()
     for epoch in range(epochs):
@@ -146,6 +152,7 @@ def train_refiner(refiner, train_data, n_features, epochs=50, lr=1e-4, device='c
 
 def run_combination_test(dataset_name, missing_rate=0.25, seq_len=96, seed=42):
     """Run the full combination test pipeline."""
+    seed_everything(seed, deterministic=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
 
@@ -161,11 +168,14 @@ def run_combination_test(dataset_name, missing_rate=0.25, seq_len=96, seed=42):
     # Train/test split
     X_train_raw = X_full[:int(0.7 * n)]
     X_test_raw = X_full[int(0.85 * n):]
+    scaler = fit_standard_scaler(X_train_raw)
 
     train_ds = TimeSeriesImputationDataset(X_train_raw, seq_len=seq_len,
-                                            missing_rate=missing_rate, seed=seed)
+                                            missing_rate=missing_rate, seed=seed,
+                                            scaler=scaler)
     test_ds = TimeSeriesImputationDataset(X_test_raw, seq_len=seq_len,
-                                           missing_rate=missing_rate, seed=seed + 1)
+                                           missing_rate=missing_rate, seed=seed + 1,
+                                           scaler=scaler)
 
     # Collect numpy arrays
     def collect(ds):
@@ -198,7 +208,9 @@ def run_combination_test(dataset_name, missing_rate=0.25, seq_len=96, seed=42):
     print("\n[3/5] Training GAN refiner (50 epochs)...")
     refiner = SimpleGANRefiner(n_features, seq_len).to(device)
     train_data = (train_obs, train_mask, train_coarse, train_intact)
-    refiner = train_refiner(refiner, train_data, n_features, epochs=50, device=device)
+    refiner = train_refiner(
+        refiner, train_data, n_features, epochs=50, device=device, seed=seed,
+    )
 
     # 4. Evaluate combination
     print("\n[4/5] Evaluating MOMENT + GAN combination...")
@@ -260,6 +272,7 @@ def run_combination_test(dataset_name, missing_rate=0.25, seq_len=96, seed=42):
     results = {
         'dataset': dataset_name,
         'missing_rate': missing_rate,
+        'seed': seed,
         'linear_interp': linear_metrics,
         'moment_alone': moment_metrics,
         'moment_plus_gan': combo_metrics,

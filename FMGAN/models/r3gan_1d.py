@@ -375,20 +375,31 @@ class RefinerDiscriminator(nn.Module):
 
 class R3GANTrainer:
     """
-    R3GAN adversarial training with:
+    R3GAN adversarial or discriminator-disabled reconstruction training with:
     - Relativistic paired GAN loss (RpGAN)
     - R1 gradient penalty (on real samples)
     - R2 gradient penalty (on fake samples)
-    - Reconstruction loss (L1 on observed positions)
+    - Reconstruction loss (L1 on artificially missing positions)
     - Frequency-domain loss (L1 on FFT magnitude)
+
+    With ``adversarial=False``, the trainer drops the discriminator entirely
+    and optimizes only the masked L1 and configured spectral reconstruction
+    terms. Set ``lambda_freq=0`` for a literal L1-only control.
     """
 
     def __init__(self, generator, discriminator,
-                 lambda_recon=10.0, lambda_freq=1.0):
+                 lambda_recon=10.0, lambda_freq=1.0,
+                 adversarial=True):
+        if adversarial and discriminator is None:
+            raise ValueError('adversarial training requires a discriminator')
         self.G = generator
-        self.D = discriminator
+        # In reconstruction-only mode, deliberately drop the discriminator
+        # reference.  This makes the control structurally discriminator-free,
+        # rather than approximating it with a large reconstruction weight.
+        self.D = discriminator if adversarial else None
         self.lambda_recon = lambda_recon
         self.lambda_freq = lambda_freq
+        self.adversarial = adversarial
 
     @staticmethod
     def gradient_penalty(samples, critics):
@@ -398,17 +409,26 @@ class R3GANTrainer:
         )
         return grad.square().sum(dim=list(range(1, grad.ndim)))
 
-    def generator_step(self, X_obs, mask, X_coarse, X_real, gamma_recon=1.0):
+    def generator_step(self, X_obs, mask, X_coarse, X_real,
+                       gamma_recon=1.0, noise=None):
         """
         Compute generator loss and return metrics.
         Call .backward() on the returned loss externally.
         """
-        X_fake = self.G(X_obs, mask, X_coarse)
+        if noise is None:
+            # Preserve compatibility with existing generators and callers.
+            X_fake = self.G(X_obs, mask, X_coarse)
+        else:
+            X_fake = self.G(X_obs, mask, X_coarse, noise=noise)
 
-        # Adversarial: relativistic paired
-        d_fake = self.D(X_fake)
-        d_real = self.D(X_real.detach())
-        adv_loss = F.softplus(-(d_fake - d_real)).mean()
+        if self.adversarial:
+            # Adversarial: relativistic paired
+            d_fake = self.D(X_fake)
+            d_real = self.D(X_real.detach())
+            adv_loss = F.softplus(-(d_fake - d_real)).mean()
+        else:
+            # Keep the metric schema stable without building or evaluating D.
+            adv_loss = X_fake.new_zeros(())
 
         # Reconstruction on MISSING positions (the actual imputation task)
         missing_mask = 1 - mask
@@ -429,12 +449,23 @@ class R3GANTrainer:
             'g_total': total.item(),
         }
 
-    def discriminator_step(self, X_obs, mask, X_coarse, X_real, gamma=0.05):
+    def discriminator_step(self, X_obs, mask, X_coarse, X_real, gamma=0.05,
+                           noise=None):
         """
         Compute discriminator loss with R1+R2 penalties.
         """
+        if not self.adversarial:
+            raise RuntimeError(
+                'discriminator_step is unavailable in reconstruction-only mode'
+            )
+
         X_real_gp = X_real.detach().requires_grad_(True)
-        X_fake = self.G(X_obs, mask, X_coarse).detach().requires_grad_(True)
+        if noise is None:
+            # The implicit-noise path remains available for legacy callers.
+            X_fake = self.G(X_obs, mask, X_coarse)
+        else:
+            X_fake = self.G(X_obs, mask, X_coarse, noise=noise)
+        X_fake = X_fake.detach().requires_grad_(True)
 
         d_real = self.D(X_real_gp)
         d_fake = self.D(X_fake)

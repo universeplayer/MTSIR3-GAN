@@ -10,6 +10,62 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 
 
+def _validate_fitted_scaler(scaler, n_features):
+    """Fail closed when a supplied scaler cannot safely transform a split."""
+    required = ('mean_', 'scale_', 'transform')
+    missing = [name for name in required if not hasattr(scaler, name)]
+    if missing:
+        raise ValueError(
+            'scaler must already be fitted on the train split; missing '
+            + ', '.join(missing)
+        )
+
+    mean = np.asarray(scaler.mean_)
+    scale = np.asarray(scaler.scale_)
+    if mean.size != n_features or scale.size != n_features:
+        raise ValueError(
+            'scaler feature count does not match data: '
+            f'{mean.size} vs {n_features}'
+        )
+    if not np.isfinite(mean).all() or not np.isfinite(scale).all():
+        raise ValueError(
+            'train-fitted scaler contains non-finite statistics; this usually '
+            'means at least one training feature is entirely NaN'
+        )
+    if np.any(scale <= 0):
+        raise ValueError('train-fitted scaler contains a non-positive scale')
+
+
+def fit_standard_scaler(X_train):
+    """Fit the experiment scaler on training timesteps only.
+
+    Keeping this operation outside ``TimeSeriesImputationDataset`` makes the
+    train/validation/test relationship explicit: fit once here, then pass the
+    returned object unchanged to every split.
+    """
+    X_train = np.asarray(X_train)
+    if X_train.ndim != 2:
+        raise ValueError(
+            f'expected 2D time series (timesteps, features), got {X_train.shape}'
+        )
+    if X_train.shape[0] == 0 or X_train.shape[1] == 0:
+        raise ValueError('cannot fit train-only scaler on an empty array')
+    if np.isinf(X_train).any():
+        raise ValueError('train-only scaler input contains infinite values')
+
+    all_nan_features = np.flatnonzero(np.isnan(X_train).all(axis=0))
+    if all_nan_features.size:
+        indices = ', '.join(str(int(index)) for index in all_nan_features)
+        raise ValueError(
+            'train-only scaling requires at least one observed value per '
+            f'feature; all-NaN training feature indices: {indices}'
+        )
+
+    scaler = StandardScaler().fit(X_train)
+    _validate_fitted_scaler(scaler, X_train.shape[1])
+    return scaler
+
+
 class MissingPatternGenerator:
     """Generate missing value masks with different patterns."""
 
@@ -76,7 +132,7 @@ class TimeSeriesImputationDataset(Dataset):
     """
 
     def __init__(self, X, seq_len=96, missing_rate=0.25, missing_pattern='point',
-                 stride=None, seed=42):
+                 stride=None, seed=42, scaler=None):
         """
         Args:
             X: numpy array of shape (total_len, n_features) - the full time series
@@ -85,18 +141,41 @@ class TimeSeriesImputationDataset(Dataset):
             missing_pattern: 'point', 'subsequence', or 'block'
             stride: step size between windows (default: seq_len // 2)
             seed: random seed for reproducibility
+            scaler: optional fitted ``StandardScaler``. If supplied, it is
+                used only for ``transform`` and is never refit. Omitting it
+                preserves the legacy standalone behavior of fitting on ``X``.
         """
+        X = np.asarray(X)
+        if X.ndim != 2:
+            raise ValueError(
+                f'expected 2D time series (timesteps, features), got {X.shape}'
+            )
         self.seq_len = seq_len
         self.missing_rate = missing_rate
         self.missing_pattern = missing_pattern
+        self.seed = int(seed)
         self.rng = np.random.default_rng(seed)
 
-        # Normalize
-        self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(X)
+        # Normalize. Formal experiments pass the train-fitted scaler to every
+        # split. The fallback retains compatibility for standalone callers.
+        if scaler is None:
+            self.scaler = fit_standard_scaler(X)
+            self.scaler_source = 'local_legacy_fit'
+        else:
+            _validate_fitted_scaler(scaler, X.shape[1])
+            self.scaler = scaler
+            self.scaler_source = 'external_train_fit'
+        X_scaled = self.scaler.transform(X)
+        introduced_nan = np.isnan(X_scaled) & ~np.isnan(X)
+        if introduced_nan.any():
+            raise ValueError(
+                'train-fitted scaler introduced NaN values at originally '
+                'observed positions; refusing to alter the evaluation mask'
+            )
 
         # Create sliding windows
         stride = stride or seq_len // 2
+        self.stride = int(stride)
         self.samples = []
         for start in range(0, len(X_scaled) - seq_len + 1, stride):
             window = X_scaled[start:start + seq_len]
@@ -141,7 +220,8 @@ class TimeSeriesImputationDataset(Dataset):
 
 
 def load_dataset(name, seq_len=96, missing_rate=0.25, missing_pattern='point',
-                 batch_size=64, seed=42, split='train', num_workers=4):
+                 batch_size=64, seed=42, split='train', num_workers=4,
+                 scaler=None):
     """
     Load a dataset by name and return train/val/test DataLoaders.
 
@@ -154,6 +234,7 @@ def load_dataset(name, seq_len=96, missing_rate=0.25, missing_pattern='point',
         seed: random seed
         split: 'train', 'val', or 'test'
         num_workers: dataloader workers
+        scaler: optional scaler previously fitted on the training split
 
     Returns:
         DataLoader for the specified split
@@ -196,11 +277,22 @@ def load_dataset(name, seq_len=96, missing_rate=0.25, missing_pattern='point',
 
     dataset = TimeSeriesImputationDataset(
         X, seq_len=seq_len, missing_rate=missing_rate,
-        missing_pattern=missing_pattern, seed=seed,
+        missing_pattern=missing_pattern, seed=seed, scaler=scaler,
     )
+
+    try:
+        from protocol import make_dataloader_generator, seed_dataloader_worker
+    except ModuleNotFoundError as exc:
+        if exc.name != 'protocol':
+            raise
+        # Support callers importing this module as
+        # ``FMGAN.data.unified_loader`` from the repository root.
+        from ..protocol import make_dataloader_generator, seed_dataloader_worker
 
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=(split == 'train'),
         num_workers=num_workers, pin_memory=True, drop_last=(split == 'train'),
+        generator=make_dataloader_generator(seed),
+        worker_init_fn=seed_dataloader_worker,
     )
     return loader

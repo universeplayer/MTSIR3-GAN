@@ -12,10 +12,11 @@ _FMGAN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _FMGAN_ROOT not in sys.path:
     sys.path.insert(0, _FMGAN_ROOT)
 
-from data.unified_loader import TimeSeriesImputationDataset
+from data.unified_loader import TimeSeriesImputationDataset, fit_standard_scaler
 from foundation_model.moment_wrapper import MOMENTImputer
 from evaluation.metrics import compute_all_metrics
 from evaluation.run_combination_test import SimpleGANRefiner, train_refiner
+from protocol import seed_everything
 
 
 def linear_interp(X_obs_np, mask_np):
@@ -45,10 +46,13 @@ def collect(ds):
 
 def eval_gan_refiner(train_obs, train_mask, train_coarse, train_intact,
                      test_obs, test_mask, test_coarse, test_intact, test_indicating,
-                     n_features, seq_len, epochs=50, device='cuda'):
+                     n_features, seq_len, epochs=50, device='cuda', seed=42):
+    seed_everything(seed, deterministic=True)
     refiner = SimpleGANRefiner(n_features, seq_len).to(device)
     train_data = (train_obs, train_mask, train_coarse, train_intact)
-    refiner = train_refiner(refiner, train_data, n_features, epochs=epochs, device=device)
+    refiner = train_refiner(
+        refiner, train_data, n_features, epochs=epochs, device=device, seed=seed,
+    )
 
     refiner.eval()
     preds = []
@@ -64,7 +68,9 @@ def eval_gan_refiner(train_obs, train_mask, train_coarse, train_intact,
     return compute_all_metrics(preds, test_intact, test_indicating)
 
 
-def run_dataset_experiment(dataset_name, data_path, seq_len, missing_rate=0.25):
+def run_dataset_experiment(dataset_name, data_path, seq_len, missing_rate=0.25,
+                           seed=42):
+    seed_everything(seed, deterministic=True)
     print()
     print('=' * 70)
     print(f'Dataset: {dataset_name} (seq_len={seq_len}, rate={missing_rate})')
@@ -75,9 +81,16 @@ def run_dataset_experiment(dataset_name, data_path, seq_len, missing_rate=0.25):
     n = len(X_full)
     X_train_raw = X_full[:int(0.7 * n)]
     X_test_raw = X_full[int(0.85 * n):]
+    scaler = fit_standard_scaler(X_train_raw)
 
-    train_ds = TimeSeriesImputationDataset(X_train_raw, seq_len=seq_len, missing_rate=missing_rate, seed=42)
-    test_ds = TimeSeriesImputationDataset(X_test_raw, seq_len=seq_len, missing_rate=missing_rate, seed=43)
+    train_ds = TimeSeriesImputationDataset(
+        X_train_raw, seq_len=seq_len, missing_rate=missing_rate, seed=seed,
+        scaler=scaler,
+    )
+    test_ds = TimeSeriesImputationDataset(
+        X_test_raw, seq_len=seq_len, missing_rate=missing_rate, seed=seed + 1,
+        scaler=scaler,
+    )
 
     train_intact, train_obs, train_mask, _ = collect(train_ds)
     test_intact, test_obs, test_mask, test_indicating = collect(test_ds)
@@ -101,7 +114,7 @@ def run_dataset_experiment(dataset_name, data_path, seq_len, missing_rate=0.25):
     results['Linear Interp + GAN'] = eval_gan_refiner(
         train_obs, train_mask, train_li, train_intact,
         test_obs, test_mask, test_li, test_intact, test_indicating,
-        n_features, seq_len, device=device
+        n_features, seq_len, device=device, seed=seed,
     )
 
     # 3. MOMENT alone
@@ -117,7 +130,7 @@ def run_dataset_experiment(dataset_name, data_path, seq_len, missing_rate=0.25):
     results['MOMENT + GAN'] = eval_gan_refiner(
         train_obs, train_mask, train_moment, train_intact,
         test_obs, test_mask, test_moment, test_intact, test_indicating,
-        n_features, seq_len, device=device
+        n_features, seq_len, device=device, seed=seed,
     )
 
     # 5. Mean fill alone (simplest baseline)
@@ -139,7 +152,7 @@ def run_dataset_experiment(dataset_name, data_path, seq_len, missing_rate=0.25):
     results['Mean Fill + GAN'] = eval_gan_refiner(
         train_obs, train_mask, train_mean_fill, train_intact,
         test_obs, test_mask, test_mean_fill, test_intact, test_indicating,
-        n_features, seq_len, device=device
+        n_features, seq_len, device=device, seed=seed,
     )
 
     # Print results
